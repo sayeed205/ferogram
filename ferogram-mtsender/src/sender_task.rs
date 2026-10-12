@@ -138,10 +138,19 @@ async fn sender_loop(
             biased;
 
             // New RPC enqueue arrived while we were waiting in step().
-            Some(enqueue) = rpc_rx.recv() => {
-                sender.enqueue(enqueue.body, enqueue.tx);
-                // Loop back immediately so step() can send it.
-                continue;
+            enqueue = rpc_rx.recv() => {
+                match enqueue {
+                    Some(enqueue) => {
+                        sender.enqueue(enqueue.body, enqueue.tx);
+                        // Loop back immediately so step() can send it.
+                        continue;
+                    }
+                    // Dropping the last PipelinedSender is how callers retire
+                    // a timed-out connection. Exit even when step() is still
+                    // waiting on that connection so its socket and pending
+                    // requests are released before the replacement is used.
+                    None => return,
+                }
             }
 
             // Reconnect request: swap the stream.

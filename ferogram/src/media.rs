@@ -113,6 +113,36 @@ type PipelinedUploadSlot = (
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, InvocationError>> + Send>>,
 );
 
+async fn wait_for_pipelined_upload_ack(
+    future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, InvocationError>> + Send>,
+    >,
+    upload_name: &str,
+    dc_id: i32,
+    worker_connection: usize,
+    part_num: i32,
+) -> Result<Vec<u8>, InvocationError> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(UPLOAD_PART_ACK_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                file = %upload_name,
+                dc_id,
+                worker_connection,
+                part_num,
+                timeout_ms = UPLOAD_PART_ACK_TIMEOUT.as_millis() as u64,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "pipelined upload part acknowledgement timed out; reconnecting worker"
+            );
+            Err(InvocationError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upload part acknowledgement timed out",
+            )))
+        }
+    }
+}
+
 /// One in-flight pipelined download request: (part index, response future).
 /// Used as the sliding-window element in
 /// [`Client::download_concurrent_to_file_pipelined`].
@@ -264,6 +294,11 @@ const UPLOAD_MAX_PER_SESSION: usize = 1024 * 1024;
 /// `kDocumentUploadPartSize{0..2}`.
 #[allow(dead_code)]
 const UPLOAD_PART_SIZES: &[usize] = &[128 * 1024, 256 * 1024, 512 * 1024];
+
+/// A pipelined upload worker must not wait indefinitely for one part's ack.
+/// Keep this below the application-level no-progress watchdog so a stuck
+/// connection can be replaced and its outstanding parts retried first.
+const UPLOAD_PART_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Choose upload part size for `file_size` bytes.
 ///
@@ -2045,12 +2080,14 @@ impl Client {
         let next_part = Arc::new(Mutex::new(UploadPartQueue::new(total_parts)));
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
+        let upload_name = name.to_owned();
 
-        for sender in senders {
+        for (worker_connection, sender) in senders.into_iter().enumerate() {
             let data = Arc::clone(&data);
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
             let worker_handle = shared_handle.clone();
+            let worker_upload_name = upload_name.clone();
             let mut sender = sender;
 
             tasks.spawn(async move {
@@ -2110,7 +2147,12 @@ impl Client {
                             }
                             Err(e) => {
                                 tracing::debug!(
-                                    "[ferogram::transfer] pipelined upload enqueue failed, reconnecting: {e}"
+                                    file = %worker_upload_name,
+                                    dc_id = worker_dc,
+                                    worker_connection,
+                                    part_num,
+                                    error = %e,
+                                    "pipelined upload enqueue failed; reconnecting worker"
                                 );
                                 total_reconnects += 1;
                                 if total_reconnects >= MAX_WORKER_RECONNECTS {
@@ -2138,7 +2180,14 @@ impl Client {
 
                     let (part_num, chunk_len, fut) =
                         window.pop_front().expect("window checked non-empty above");
-                    let result = fut.await;
+                    let result = wait_for_pipelined_upload_ack(
+                        fut,
+                        &worker_upload_name,
+                        worker_dc,
+                        worker_connection,
+                        part_num,
+                    )
+                    .await;
                     let err = match result {
                         Ok(_) => {
                             if let Some(ref h) = worker_handle {
@@ -2217,7 +2266,15 @@ impl Client {
                     }
                     let backoff_ms = 300u64 * (1u64 << (total_reconnects - 1));
                     tracing::warn!(
-                        "[ferogram::transfer] pipelined upload worker error ({err}); reconnecting (attempt {total_reconnects}/{MAX_WORKER_RECONNECTS}, backoff {backoff_ms}ms)"
+                        file = %worker_upload_name,
+                        dc_id = worker_dc,
+                        worker_connection,
+                        part_num,
+                        error = %err,
+                        reconnect_attempt = total_reconnects,
+                        max_reconnects = MAX_WORKER_RECONNECTS,
+                        backoff_ms,
+                        "pipelined upload worker error; reconnecting"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     let mut g = next_part.lock().await;
@@ -2653,12 +2710,14 @@ impl Client {
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
         let path_arc = std::sync::Arc::new(path.to_path_buf());
+        let upload_name = name.to_owned();
 
-        for sender in senders {
+        for (worker_connection, sender) in senders.into_iter().enumerate() {
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
             let worker_handle = shared_handle.clone();
             let path_arc = std::sync::Arc::clone(&path_arc);
+            let worker_upload_name = upload_name.clone();
             let mut sender = sender;
 
             tasks.spawn(async move {
@@ -2725,7 +2784,12 @@ impl Client {
                             }
                             Err(e) => {
                                 tracing::debug!(
-                                    "[ferogram::transfer] pipelined upload enqueue failed, reconnecting: {e}"
+                                    file = %worker_upload_name,
+                                    dc_id = worker_dc,
+                                    worker_connection,
+                                    part_num,
+                                    error = %e,
+                                    "pipelined upload enqueue failed; reconnecting worker"
                                 );
                                 total_reconnects += 1;
                                 if total_reconnects >= MAX_WORKER_RECONNECTS {
@@ -2753,7 +2817,14 @@ impl Client {
 
                     let (part_num, chunk_len, fut) =
                         window.pop_front().expect("window checked non-empty above");
-                    let result = fut.await;
+                    let result = wait_for_pipelined_upload_ack(
+                        fut,
+                        &worker_upload_name,
+                        worker_dc,
+                        worker_connection,
+                        part_num,
+                    )
+                    .await;
                     let err = match result {
                         Ok(_) => {
                             if let Some(ref h) = worker_handle {
@@ -2841,7 +2912,15 @@ impl Client {
                     }
                     let backoff_ms = 300u64 * (1u64 << (total_reconnects - 1));
                     tracing::warn!(
-                        "[ferogram::transfer] pipelined upload worker error ({err}); reconnecting (attempt {total_reconnects}/{MAX_WORKER_RECONNECTS}, backoff {backoff_ms}ms)"
+                        file = %worker_upload_name,
+                        dc_id = worker_dc,
+                        worker_connection,
+                        part_num,
+                        error = %err,
+                        reconnect_attempt = total_reconnects,
+                        max_reconnects = MAX_WORKER_RECONNECTS,
+                        backoff_ms,
+                        "pipelined upload worker error; reconnecting"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     let mut g = next_part.lock().await;
