@@ -583,9 +583,19 @@ impl Client {
         path: impl AsRef<std::path::Path>,
         handle: Option<&TransferHandle>,
     ) -> Result<media::UploadedFile, InvocationError> {
+        let path = path.as_ref();
+        media::retry_migrated_upload(handle, |dc| self.upload_sequential_on_dc(path, handle, dc))
+            .await
+    }
+
+    async fn upload_sequential_on_dc(
+        &self,
+        path: &std::path::Path,
+        handle: Option<&TransferHandle>,
+        dc_id: i32,
+    ) -> Result<media::UploadedFile, InvocationError> {
         use tokio::io::AsyncReadExt;
 
-        let path = path.as_ref();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let meta = tokio::fs::metadata(path)
             .await
@@ -639,7 +649,7 @@ impl Client {
 
             if big {
                 self.rpc_transfer_on_dc_pub(
-                    0,
+                    dc_id,
                     &tl::functions::upload::SaveBigFilePart {
                         file_id,
                         file_part: part_num,
@@ -650,7 +660,7 @@ impl Client {
                 .await?;
             } else {
                 self.rpc_transfer_on_dc_pub(
-                    0,
+                    dc_id,
                     &tl::functions::upload::SaveFilePart {
                         file_id,
                         file_part: part_num,

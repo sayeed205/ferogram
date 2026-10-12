@@ -258,6 +258,11 @@ impl TransferHandle {
         self.inner.bytes_done.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub(crate) fn reset_progress(&self) {
+        self.inner.bytes_done.store(0, Ordering::Relaxed);
+        self.reset_start();
+    }
+
     pub(crate) fn reset_start(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

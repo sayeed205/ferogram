@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pipelined uploads requeue only unacknowledged parts after connection failures.
+  DC redirects stop the old workers before restarting with a fresh file ID and
+  progress counter, preventing duplicate byte counts and mixed upload sessions.
+
 - `DcPool` now evicts a DC slot on `CONNECTION_NOT_INITED` (RPC 400), in
   `finish_call`, `invoke_on_dc` and `invoke_on_dc_serializable`. The next
   `invoke_on_dc` call redoes initConnection and recovers instead of failing

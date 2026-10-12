@@ -14,13 +14,95 @@
 
 use crate::DcEntry;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferogram_tl_types as tl;
 use ferogram_tl_types::{Cursor, Deserializable};
 use tokio::sync::Mutex;
 
 use crate::{Client, InvocationError};
+
+/// Part ownership is shared across workers; recovery returns only unacknowledged parts.
+struct UploadPartQueue {
+    next: i32,
+    total: i32,
+    retry: std::collections::VecDeque<i32>,
+}
+
+impl UploadPartQueue {
+    fn new(total: i32) -> Self {
+        Self {
+            next: 0,
+            total,
+            retry: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn claim(&mut self) -> Option<i32> {
+        if let Some(part) = self.retry.pop_front() {
+            return Some(part);
+        }
+        if self.next >= self.total {
+            return None;
+        }
+        let part = self.next;
+        self.next += 1;
+        Some(part)
+    }
+
+    fn retry(&mut self, failed: i32, pending: impl Iterator<Item = i32>) {
+        self.retry.push_back(failed);
+        self.retry.extend(pending);
+    }
+}
+
+pub(crate) async fn retry_migrated_upload<T, F, Fut>(
+    handle: Option<&crate::transfer::TransferHandle>,
+    mut upload: F,
+) -> Result<T, InvocationError>
+where
+    F: FnMut(i32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, InvocationError>>,
+{
+    let mut dc = 0;
+    for _ in 0..4 {
+        if let Some(handle) = handle {
+            handle.poll_pause_cancel().await?;
+            handle.reset_progress();
+        }
+        match upload(dc).await {
+            Err(InvocationError::Rpc(ref rpc)) if rpc.code == 303 => {
+                let Some(next_dc) = rpc.value.filter(|dc| *dc > 0) else {
+                    return Err(InvocationError::Deserialize(
+                        "upload redirect missing DC".into(),
+                    ));
+                };
+                dc = next_dc as i32;
+                tracing::debug!(dc, "restarting upload after DC redirect");
+            }
+            result => return result,
+        }
+    }
+    Err(InvocationError::Deserialize(
+        "too many upload DC redirects".into(),
+    ))
+}
+
+async fn finish_upload_workers(
+    mut tasks: tokio::task::JoinSet<Result<(), InvocationError>>,
+) -> Result<(), InvocationError> {
+    while let Some(result) = tasks.join_next().await {
+        let result =
+            result.map_err(|error| InvocationError::Io(std::io::Error::other(error.to_string())));
+        if let Err(error) = result.and_then(|result| result) {
+            tasks.abort_all();
+            // No old worker may update the handle after the next attempt resets it.
+            while tasks.join_next().await.is_some() {}
+            return Err(error);
+        }
+    }
+    Ok(())
+}
 
 /// One in-flight pipelined upload request: (part index, part length in
 /// bytes, response future). Used as the sliding-window element in
@@ -1506,6 +1588,20 @@ impl Client {
         mime_type: &str,
         handle: Option<&crate::transfer::TransferHandle>,
     ) -> Result<UploadedFile, InvocationError> {
+        retry_migrated_upload(handle, |dc| {
+            self.upload_bytes_on_dc(data, name, mime_type, handle, dc)
+        })
+        .await
+    }
+
+    async fn upload_bytes_on_dc(
+        &self,
+        data: &[u8],
+        name: &str,
+        mime_type: &str,
+        handle: Option<&crate::transfer::TransferHandle>,
+        dc_id: i32,
+    ) -> Result<UploadedFile, InvocationError> {
         // Zero-byte upload produces parts=0; add 1 to satisfy FILE_PART_0_MISSING check.
         if data.is_empty() {
             return Err(InvocationError::Deserialize(
@@ -1537,7 +1633,7 @@ impl Client {
             if big {
                 // Always through transfer pool, never main session.
                 self.rpc_transfer_on_dc_pub(
-                    0,
+                    dc_id,
                     &tl::functions::upload::SaveBigFilePart {
                         file_id,
                         file_part: part_num as i32,
@@ -1548,7 +1644,7 @@ impl Client {
                 .await?;
             } else {
                 self.rpc_transfer_on_dc_pub(
-                    0,
+                    dc_id,
                     &tl::functions::upload::SaveFilePart {
                         file_id,
                         file_part: part_num as i32,
@@ -1591,6 +1687,20 @@ impl Client {
         name: &str,
         mime_type: &str,
         handle: Option<&crate::transfer::TransferHandle>,
+    ) -> Result<UploadedFile, InvocationError> {
+        retry_migrated_upload(handle, |dc| {
+            self.upload_concurrent_on_dc(Arc::clone(&data), name, mime_type, handle, dc)
+        })
+        .await
+    }
+
+    async fn upload_concurrent_on_dc(
+        &self,
+        data: Arc<Vec<u8>>,
+        name: &str,
+        mime_type: &str,
+        handle: Option<&crate::transfer::TransferHandle>,
+        dc_id: i32,
     ) -> Result<UploadedFile, InvocationError> {
         // Zero-byte upload produces parts=0; add 1 to satisfy FILE_PART_0_MISSING check.
         if data.is_empty() {
@@ -1636,19 +1746,7 @@ impl Client {
             .await
             .expect("worker semaphore unexpectedly closed");
 
-        // file_id is shared across workers.
-        // On FILE_MIGRATE the first worker that detects the migration stores a
-        // NEW file_id here so all workers restart from part 0 with a fresh id
-        // on the new DC. Reusing the old id on a different DC causes the server
-        // to return FILE_ID_INVALID / MEDIA_EMPTY at sendMedia time.
-        let file_id_atomic =
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(crate::random_i64_pub()));
-
-        // FILE_MIGRATE is a per-file-id directive  - ALL workers
-        // must redirect to the same new DC, not just the one that received the error.
-        // Share the current upload DC as an atomic so any migrating worker updates
-        // it and all others follow on their next iteration.  0 = home DC (sentinel).
-        let upload_dc = Arc::new(AtomicI32::new(0i32));
+        let file_id = crate::random_i64_pub();
 
         // Open all worker connections concurrently.
         let mut open_set: tokio::task::JoinSet<
@@ -1656,7 +1754,7 @@ impl Client {
         > = tokio::task::JoinSet::new();
         for _ in 0..n_workers {
             let client = self.clone();
-            open_set.spawn(async move { client.open_worker_conn(0).await });
+            open_set.spawn(async move { client.open_worker_conn(dc_id).await });
         }
         let mut conns: Vec<crate::dc_pool::DcConnection> = Vec::with_capacity(n_workers);
         while let Some(res) = open_set.join_next().await {
@@ -1673,12 +1771,12 @@ impl Client {
                 "[ferogram::transfer] no worker connections available; uploading sequentially"
             );
             return self
-                .upload_bytes(&data, name, mime_type, shared_handle.as_ref())
+                .upload_bytes_on_dc(&data, name, mime_type, shared_handle.as_ref(), dc_id)
                 .await;
         }
         let actual_workers = conns.len();
 
-        let next_part = Arc::new(Mutex::new(0i32));
+        let next_part = Arc::new(Mutex::new(UploadPartQueue::new(total_parts)));
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
 
@@ -1686,39 +1784,21 @@ impl Client {
             let data = Arc::clone(&data);
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
-            let upload_dc = Arc::clone(&upload_dc);
-            let file_id_atomic = std::sync::Arc::clone(&file_id_atomic);
             let worker_handle = shared_handle.clone();
 
             tasks.spawn(async move {
                 // Reconnect budget is per-worker lifetime.
                 const MAX_WORKER_RECONNECTS: u8 = 5;
                 let mut total_reconnects = 0u8;
-                // Mutable: FILE_MIGRATE (303) can redirect uploads to another DC.
-                // worker_dc stays in sync with the shared upload_dc atomic.
-                let mut worker_dc = 0i32; // 0 = home DC
+                let worker_dc = dc_id; // 0 = home DC
 
                 loop {
-                    // Read file_id, dc, and part_num under one next_part lock so
-                    // FILE_MIGRATE's triple-update is atomic with respect to all workers.
-                    let (part_num, file_id, current_dc) = {
-                        let mut g = next_part.lock().await;
-                        let fid = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                        let dc = upload_dc.load(Ordering::Relaxed);
-                        if *g >= total_parts {
-                            break;
-                        }
-                        let n = *g;
-                        *g += 1;
-                        (n, fid, dc)
+                    let part_num = {
+                        let mut parts = next_part.lock().await;
+                        let Some(part) = parts.claim() else { break; };
+                        part
                     };
-                    if current_dc != worker_dc {
-                        worker_dc = current_dc;
-                        conn = match client.open_worker_conn(worker_dc).await {
-                            Ok(c) => c,
-                            Err(e) => return Err(e),
-                        };
-                    }
+
                     let start = part_num as usize * part_size;
                     let end = (start + part_size).min(data.len());
                     let bytes = data[start..end].to_vec();
@@ -1772,38 +1852,8 @@ impl Client {
                             }
                             // FILE_MIGRATE: server redirected upload to a different DC.
                             if rpc.code == 303 {
-                                let new_dc = rpc.value.unwrap_or(1) as i32;
-                                tracing::debug!("[ferogram::transfer] upload redirected by FILE_MIGRATE to DC{new_dc} (was DC{worker_dc})"
-                                );
-                                // On FILE_MIGRATE, use a NEW file_id on
-                                // the new DC. The original DC's partial upload is abandoned.
-                                // Reusing the old file_id on a different DC causes the server
-                                // to return FILE_ID_INVALID / MEDIA_EMPTY at sendMedia time
-                                // because the new DC has no record of that file_id.
-                                // Signal the outer task to restart with a fresh file_id by
-                                // returning a sentinel error; the outer loop handles it.
-                                // Store new file_id BEFORE publishing DC change so
-                                // other workers see the new id atomically with the DC switch.
-                                // Hold next_part lock across all three stores.
-                                {
-                                    let mut g = next_part.lock().await;
-                                    file_id_atomic.store(
-                                        crate::random_i64_pub(),
-                                        std::sync::atomic::Ordering::SeqCst,
-                                    );
-                                    upload_dc.store(new_dc, Ordering::SeqCst);
-                                    *g = 0;
-                                }
-                                worker_dc = new_dc;
-                                match client.open_worker_conn(new_dc).await {
-                                    Ok(c) => {
-                                        conn = c;
-                                        continue;
-                                    }
-                                    Err(e) => return Err(e),
-                                }
+                                return Err(err);
                             }
-                            // AUTH_KEY_UNREGISTERED: reopen with fresh DH + importAuth.
                             if rpc.name == "AUTH_KEY_UNREGISTERED" {
                                 tracing::warn!(
                                     "[ferogram::transfer] upload: AUTH_KEY_UNREGISTERED on DC{worker_dc}; re-establishing worker connection (attempt {}/{MAX_WORKER_RECONNECTS})",
@@ -1849,16 +1899,8 @@ impl Client {
             });
         }
 
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) =
-                res.map_err(|e| InvocationError::Io(std::io::Error::other(e.to_string())))?
-            {
-                tasks.abort_all();
-                return Err(e);
-            }
-        }
+        finish_upload_workers(tasks).await?;
 
-        let file_id = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
         let inner = to_input_file(big, file_id, total_parts, name, &data);
         tracing::info!(
             "[ferogram::transfer] upload complete: '{}' ({:.1} MiB / {} bytes, {} parts x {}B, DC{}, Y={} connections, took {:.2}s)",
@@ -1903,6 +1945,20 @@ impl Client {
         name: &str,
         mime_type: &str,
         handle: Option<&crate::transfer::TransferHandle>,
+    ) -> Result<UploadedFile, InvocationError> {
+        retry_migrated_upload(handle, |dc| {
+            self.upload_concurrent_pipelined_on_dc(Arc::clone(&data), name, mime_type, handle, dc)
+        })
+        .await
+    }
+
+    async fn upload_concurrent_pipelined_on_dc(
+        &self,
+        data: Arc<Vec<u8>>,
+        name: &str,
+        mime_type: &str,
+        handle: Option<&crate::transfer::TransferHandle>,
+        dc_id: i32,
     ) -> Result<UploadedFile, InvocationError> {
         if data.is_empty() {
             return Err(InvocationError::Deserialize(
@@ -1950,20 +2006,18 @@ impl Client {
         if n_workers == 1 {
             drop(_global_guard);
             return self
-                .upload_bytes(&data, name, mime_type, shared_handle.as_ref())
+                .upload_bytes_on_dc(&data, name, mime_type, shared_handle.as_ref(), dc_id)
                 .await;
         }
 
-        let file_id_atomic =
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(crate::random_i64_pub()));
-        let upload_dc = Arc::new(AtomicI32::new(0i32));
+        let file_id = crate::random_i64_pub();
 
         let mut open_set: tokio::task::JoinSet<
             Result<crate::client::PipelinedSender, InvocationError>,
         > = tokio::task::JoinSet::new();
         for _ in 0..n_workers {
             let client = self.clone();
-            open_set.spawn(async move { client.open_worker_sender(0).await });
+            open_set.spawn(async move { client.open_worker_sender(dc_id).await });
         }
         let mut senders: Vec<crate::client::PipelinedSender> = Vec::with_capacity(n_workers);
         while let Some(res) = open_set.join_next().await {
@@ -1982,11 +2036,13 @@ impl Client {
                 "[ferogram::transfer] no pipelined worker connections available; falling back to non-pipelined concurrent upload"
             );
             drop(_global_guard);
-            return self.upload_concurrent(data, name, mime_type, handle).await;
+            return self
+                .upload_concurrent_on_dc(data, name, mime_type, handle, dc_id)
+                .await;
         }
         let actual_workers = senders.len();
 
-        let next_part = Arc::new(Mutex::new(0i32));
+        let next_part = Arc::new(Mutex::new(UploadPartQueue::new(total_parts)));
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
 
@@ -1994,15 +2050,13 @@ impl Client {
             let data = Arc::clone(&data);
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
-            let upload_dc = Arc::clone(&upload_dc);
-            let file_id_atomic = std::sync::Arc::clone(&file_id_atomic);
             let worker_handle = shared_handle.clone();
             let mut sender = sender;
 
             tasks.spawn(async move {
                 const MAX_WORKER_RECONNECTS: u8 = 5;
                 let mut total_reconnects = 0u8;
-                let mut worker_dc = 0i32;
+                let worker_dc = dc_id;
 
                 // Sliding window of (part_num, chunk_len, response_future).
                 // Each future resolves to the raw `Bool` RPC response  - upload
@@ -2021,27 +2075,11 @@ impl Client {
                 loop {
                     // Top up the window to upload_pipeline_depth before draining the front.
                     while window.len() < client.inner.transfer_limits.upload_pipeline_depth {
-                        let (part_num, file_id, current_dc) = {
-                            let mut g = next_part.lock().await;
-                            let fid = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                            let dc = upload_dc.load(Ordering::Relaxed);
-                            if *g >= total_parts {
-                                break;
-                            }
-                            let n = *g;
-                            *g += 1;
-                            (n, fid, dc)
+                        let part_num = {
+                            let mut parts = next_part.lock().await;
+                            let Some(part) = parts.claim() else { break; };
+                            part
                         };
-                        if current_dc != worker_dc {
-                            worker_dc = current_dc;
-                            sender = match client.open_worker_sender(worker_dc).await {
-                                Ok(s) => s,
-                                Err(e) => return Err(e),
-                            };
-                            // A redirect invalidates any parts still in flight from the
-                            // old file_id/DC; the window was for the old upload session.
-                            window.clear();
-                        }
 
                         let bytes = slice_part(part_num);
                         let chunk_len = bytes.len() as u64;
@@ -2085,18 +2123,10 @@ impl Client {
                                     Ok(s) => s,
                                     Err(e) => return Err(e),
                                 };
-                                // Re-queue this part: rewind past it and anything else
-                                // still in the window before clearing.
-                                let min_part = window
-                                    .iter()
-                                    .map(|(p, _, _)| *p)
-                                    .min()
-                                    .unwrap_or(part_num)
-                                    .min(part_num);
-                                window.clear();
                                 let mut g = next_part.lock().await;
-                                *g = (*g).min(min_part);
-                                break;
+                                g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
+                                drop(g);
+                                continue;
                             }
                         }
                     }
@@ -2127,8 +2157,6 @@ impl Client {
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                             // Retry the same part directly  - re-enqueue at front of window.
-                            let file_id =
-                                file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
                             let bytes = slice_part(part_num);
                             let raw_req = if big {
                                 tl::Serializable::to_bytes(
@@ -2156,26 +2184,7 @@ impl Client {
                             }
                         }
                         if rpc.code == 303 {
-                            let new_dc = rpc.value.unwrap_or(1) as i32;
-                            tracing::debug!(
-                                "[ferogram::transfer] pipelined upload redirected by FILE_MIGRATE to DC{new_dc} (was DC{worker_dc})"
-                            );
-                            {
-                                let mut g = next_part.lock().await;
-                                file_id_atomic.store(
-                                    crate::random_i64_pub(),
-                                    std::sync::atomic::Ordering::SeqCst,
-                                );
-                                upload_dc.store(new_dc, Ordering::SeqCst);
-                                *g = 0;
-                            }
-                            worker_dc = new_dc;
-                            window.clear();
-                            sender = match client.open_worker_sender(new_dc).await {
-                                Ok(s) => s,
-                                Err(e) => return Err(e),
-                            };
-                            continue;
+                            return Err(err);
                         }
                         if rpc.name == "AUTH_KEY_UNREGISTERED" {
                             tracing::warn!(
@@ -2188,15 +2197,8 @@ impl Client {
                             }
                             let backoff_ms = 300u64 * (1u64 << (total_reconnects - 1));
                             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                            let min_part = window
-                                .iter()
-                                .map(|(p, _, _)| *p)
-                                .min()
-                                .unwrap_or(part_num)
-                                .min(part_num);
-                            window.clear();
                             let mut g = next_part.lock().await;
-                            *g = (*g).min(min_part);
+                            g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
                             drop(g);
                             sender = match client.open_worker_sender(worker_dc).await {
                                 Ok(s) => s,
@@ -2218,15 +2220,8 @@ impl Client {
                         "[ferogram::transfer] pipelined upload worker error ({err}); reconnecting (attempt {total_reconnects}/{MAX_WORKER_RECONNECTS}, backoff {backoff_ms}ms)"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    let min_part = window
-                        .iter()
-                        .map(|(p, _, _)| *p)
-                        .min()
-                        .unwrap_or(part_num)
-                        .min(part_num);
-                    window.clear();
                     let mut g = next_part.lock().await;
-                    *g = (*g).min(min_part);
+                    g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
                     drop(g);
                     sender = match client.open_worker_sender(worker_dc).await {
                         Ok(s) => s,
@@ -2237,16 +2232,8 @@ impl Client {
             });
         }
 
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) =
-                res.map_err(|e| InvocationError::Io(std::io::Error::other(e.to_string())))?
-            {
-                tasks.abort_all();
-                return Err(e);
-            }
-        }
+        finish_upload_workers(tasks).await?;
 
-        let file_id = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
         let inner = to_input_file(big, file_id, total_parts, name, &data);
         tracing::info!(
             "[ferogram::transfer] pipelined upload complete: '{}' ({:.1} MiB / {} bytes, {} parts x {}B, DC{}, Y={} connections, X={} in-flight, took {:.2}s)",
@@ -2272,12 +2259,13 @@ impl Client {
     /// Each worker opens its own independent file handle, seeks to its part offset,
     /// reads exactly `part_size` bytes, and sends. Peak RAM usage is
     /// `n_workers * part_size` (at most 4 x 512 KB = 2 MB) regardless of file size.
-    pub(crate) async fn upload_streaming(
+    async fn upload_streaming_on_dc(
         &self,
         path: &std::path::Path,
         name: &str,
         mime_type: &str,
         handle: Option<&crate::transfer::TransferHandle>,
+        dc_id: i32,
     ) -> Result<UploadedFile, InvocationError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -2326,16 +2314,14 @@ impl Client {
             .await
             .expect("worker semaphore unexpectedly closed");
 
-        let file_id_atomic =
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(crate::random_i64_pub()));
-        let upload_dc = Arc::new(AtomicI32::new(0i32));
+        let file_id = crate::random_i64_pub();
 
         let mut open_set: tokio::task::JoinSet<
             Result<crate::dc_pool::DcConnection, InvocationError>,
         > = tokio::task::JoinSet::new();
         for _ in 0..n_workers {
             let client = self.clone();
-            open_set.spawn(async move { client.open_worker_conn(0).await });
+            open_set.spawn(async move { client.open_worker_conn(dc_id).await });
         }
         let mut conns: Vec<crate::dc_pool::DcConnection> = Vec::with_capacity(n_workers);
         while let Some(res) = open_set.join_next().await {
@@ -2359,12 +2345,12 @@ impl Client {
                 .await
                 .map_err(InvocationError::Io)?;
             return self
-                .upload_bytes(&data, name, mime_type, shared_handle.as_ref())
+                .upload_bytes_on_dc(&data, name, mime_type, shared_handle.as_ref(), dc_id)
                 .await;
         }
         let actual_workers = conns.len();
 
-        let next_part = Arc::new(Mutex::new(0i32));
+        let next_part = Arc::new(Mutex::new(UploadPartQueue::new(total_parts)));
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
 
@@ -2373,42 +2359,24 @@ impl Client {
         for mut conn in conns {
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
-            let upload_dc = Arc::clone(&upload_dc);
-            let file_id_atomic = std::sync::Arc::clone(&file_id_atomic);
             let worker_handle = shared_handle.clone();
             let path_arc = std::sync::Arc::clone(&path_arc);
 
             tasks.spawn(async move {
                 const MAX_WORKER_RECONNECTS: u8 = 5;
                 let mut total_reconnects = 0u8;
-                let mut worker_dc = 0i32;
+                let worker_dc = dc_id;
 
                 let mut file = tokio::fs::File::open(&*path_arc)
                     .await
                     .map_err(InvocationError::Io)?;
 
                 loop {
-                    let (part_num, file_id, current_dc) = {
-                        let mut g = next_part.lock().await;
-                        let fid = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                        let dc = upload_dc.load(Ordering::Relaxed);
-                        if *g >= total_parts {
-                            break;
-                        }
-                        let n = *g;
-                        *g += 1;
-                        (n, fid, dc)
+                    let part_num = {
+                        let mut parts = next_part.lock().await;
+                        let Some(part) = parts.claim() else { break; };
+                        part
                     };
-                    if current_dc != worker_dc {
-                        worker_dc = current_dc;
-                        conn = match client.open_worker_conn(worker_dc).await {
-                            Ok(c) => c,
-                            Err(e) => return Err(e),
-                        };
-                        file = tokio::fs::File::open(&*path_arc)
-                            .await
-                            .map_err(InvocationError::Io)?;
-                    }
 
                     let start = part_num as u64 * part_size as u64;
                     let end = (start + part_size as u64).min(total as u64);
@@ -2463,29 +2431,7 @@ impl Client {
                                 continue;
                             }
                             if rpc.code == 303 {
-                                let new_dc = rpc.value.unwrap_or(1) as i32;
-                                tracing::debug!("[ferogram::transfer] upload redirected by FILE_MIGRATE to DC{new_dc} (was DC{worker_dc})"
-                                );
-                                {
-                                    let mut g = next_part.lock().await;
-                                    file_id_atomic.store(
-                                        crate::random_i64_pub(),
-                                        std::sync::atomic::Ordering::SeqCst,
-                                    );
-                                    upload_dc.store(new_dc, Ordering::SeqCst);
-                                    *g = 0;
-                                }
-                                worker_dc = new_dc;
-                                match client.open_worker_conn(new_dc).await {
-                                    Ok(c) => {
-                                        conn = c;
-                                        file = tokio::fs::File::open(&*path_arc)
-                                            .await
-                                            .map_err(InvocationError::Io)?;
-                                        continue;
-                                    }
-                                    Err(e) => return Err(e),
-                                }
+                                return Err(err);
                             }
                             if rpc.name == "AUTH_KEY_UNREGISTERED" {
                                 tracing::warn!(
@@ -2530,16 +2476,8 @@ impl Client {
             });
         }
 
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) =
-                res.map_err(|e| InvocationError::Io(std::io::Error::other(e.to_string())))?
-            {
-                tasks.abort_all();
-                return Err(e);
-            }
-        }
+        finish_upload_workers(tasks).await?;
 
-        let file_id = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
         let inner = if big {
             tl::enums::InputFile::Big(tl::types::InputFileBig {
                 id: file_id,
@@ -2602,6 +2540,20 @@ impl Client {
         mime_type: &str,
         handle: Option<&crate::transfer::TransferHandle>,
     ) -> Result<UploadedFile, InvocationError> {
+        retry_migrated_upload(handle, |dc| {
+            self.upload_streaming_pipelined_on_dc(path, name, mime_type, handle, dc)
+        })
+        .await
+    }
+
+    async fn upload_streaming_pipelined_on_dc(
+        &self,
+        path: &std::path::Path,
+        name: &str,
+        mime_type: &str,
+        handle: Option<&crate::transfer::TransferHandle>,
+        dc_id: i32,
+    ) -> Result<UploadedFile, InvocationError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
         let meta = tokio::fs::metadata(path)
@@ -2661,20 +2613,18 @@ impl Client {
                 .await
                 .map_err(InvocationError::Io)?;
             return self
-                .upload_bytes(&data, name, mime_type, shared_handle.as_ref())
+                .upload_bytes_on_dc(&data, name, mime_type, shared_handle.as_ref(), dc_id)
                 .await;
         }
 
-        let file_id_atomic =
-            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(crate::random_i64_pub()));
-        let upload_dc = Arc::new(AtomicI32::new(0i32));
+        let file_id = crate::random_i64_pub();
 
         let mut open_set: tokio::task::JoinSet<
             Result<crate::client::PipelinedSender, InvocationError>,
         > = tokio::task::JoinSet::new();
         for _ in 0..n_workers {
             let client = self.clone();
-            open_set.spawn(async move { client.open_worker_sender(0).await });
+            open_set.spawn(async move { client.open_worker_sender(dc_id).await });
         }
         let mut senders: Vec<crate::client::PipelinedSender> = Vec::with_capacity(n_workers);
         while let Some(res) = open_set.join_next().await {
@@ -2693,11 +2643,13 @@ impl Client {
                 "[ferogram::transfer] no pipelined worker connections available; falling back to non-pipelined concurrent upload"
             );
             drop(_global_guard);
-            return self.upload_streaming(path, name, mime_type, handle).await;
+            return self
+                .upload_streaming_on_dc(path, name, mime_type, handle, dc_id)
+                .await;
         }
         let actual_workers = senders.len();
 
-        let next_part = Arc::new(Mutex::new(0i32));
+        let next_part = Arc::new(Mutex::new(UploadPartQueue::new(total_parts)));
         let mut tasks: tokio::task::JoinSet<Result<(), InvocationError>> =
             tokio::task::JoinSet::new();
         let path_arc = std::sync::Arc::new(path.to_path_buf());
@@ -2705,8 +2657,6 @@ impl Client {
         for sender in senders {
             let next_part = Arc::clone(&next_part);
             let client = self.clone();
-            let upload_dc = Arc::clone(&upload_dc);
-            let file_id_atomic = std::sync::Arc::clone(&file_id_atomic);
             let worker_handle = shared_handle.clone();
             let path_arc = std::sync::Arc::clone(&path_arc);
             let mut sender = sender;
@@ -2714,7 +2664,7 @@ impl Client {
             tasks.spawn(async move {
                 const MAX_WORKER_RECONNECTS: u8 = 5;
                 let mut total_reconnects = 0u8;
-                let mut worker_dc = 0i32;
+                let worker_dc = dc_id;
 
                 let mut file = tokio::fs::File::open(&*path_arc)
                     .await
@@ -2731,30 +2681,11 @@ impl Client {
                 loop {
                     // Top up the window to upload_pipeline_depth before draining the front.
                     while window.len() < client.inner.transfer_limits.upload_pipeline_depth {
-                        let (part_num, file_id, current_dc) = {
-                            let mut g = next_part.lock().await;
-                            let fid = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
-                            let dc = upload_dc.load(Ordering::Relaxed);
-                            if *g >= total_parts {
-                                break;
-                            }
-                            let n = *g;
-                            *g += 1;
-                            (n, fid, dc)
+                        let part_num = {
+                            let mut parts = next_part.lock().await;
+                            let Some(part) = parts.claim() else { break; };
+                            part
                         };
-                        if current_dc != worker_dc {
-                            worker_dc = current_dc;
-                            sender = match client.open_worker_sender(worker_dc).await {
-                                Ok(s) => s,
-                                Err(e) => return Err(e),
-                            };
-                            file = tokio::fs::File::open(&*path_arc)
-                                .await
-                                .map_err(InvocationError::Io)?;
-                            // A redirect invalidates any parts still in flight from the
-                            // old file_id/DC; the window was for the old upload session.
-                            window.clear();
-                        }
 
                         let start = part_num as u64 * part_size as u64;
                         let end = (start + part_size as u64).min(total as u64);
@@ -2807,18 +2738,10 @@ impl Client {
                                     Ok(s) => s,
                                     Err(e) => return Err(e),
                                 };
-                                // Re-queue this part: rewind past it and anything else
-                                // still in the window before clearing.
-                                let min_part = window
-                                    .iter()
-                                    .map(|(p, _, _)| *p)
-                                    .min()
-                                    .unwrap_or(part_num)
-                                    .min(part_num);
-                                window.clear();
                                 let mut g = next_part.lock().await;
-                                *g = (*g).min(min_part);
-                                break;
+                                g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
+                                drop(g);
+                                continue;
                             }
                         }
                     }
@@ -2849,8 +2772,6 @@ impl Client {
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                             // Retry the same part directly  - re-enqueue at front of window.
-                            let file_id =
-                                file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
                             let start = part_num as u64 * part_size as u64;
                             let end = (start + part_size as u64).min(total as u64);
                             let len = (end - start) as usize;
@@ -2887,29 +2808,7 @@ impl Client {
                             }
                         }
                         if rpc.code == 303 {
-                            let new_dc = rpc.value.unwrap_or(1) as i32;
-                            tracing::debug!(
-                                "[ferogram::transfer] pipelined upload redirected by FILE_MIGRATE to DC{new_dc} (was DC{worker_dc})"
-                            );
-                            {
-                                let mut g = next_part.lock().await;
-                                file_id_atomic.store(
-                                    crate::random_i64_pub(),
-                                    std::sync::atomic::Ordering::SeqCst,
-                                );
-                                upload_dc.store(new_dc, Ordering::SeqCst);
-                                *g = 0;
-                            }
-                            worker_dc = new_dc;
-                            window.clear();
-                            sender = match client.open_worker_sender(new_dc).await {
-                                Ok(s) => s,
-                                Err(e) => return Err(e),
-                            };
-                            file = tokio::fs::File::open(&*path_arc)
-                                .await
-                                .map_err(InvocationError::Io)?;
-                            continue;
+                            return Err(err);
                         }
                         if rpc.name == "AUTH_KEY_UNREGISTERED" {
                             tracing::warn!(
@@ -2922,15 +2821,8 @@ impl Client {
                             }
                             let backoff_ms = 300u64 * (1u64 << (total_reconnects - 1));
                             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                            let min_part = window
-                                .iter()
-                                .map(|(p, _, _)| *p)
-                                .min()
-                                .unwrap_or(part_num)
-                                .min(part_num);
-                            window.clear();
                             let mut g = next_part.lock().await;
-                            *g = (*g).min(min_part);
+                            g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
                             drop(g);
                             sender = match client.open_worker_sender(worker_dc).await {
                                 Ok(s) => s,
@@ -2952,15 +2844,8 @@ impl Client {
                         "[ferogram::transfer] pipelined upload worker error ({err}); reconnecting (attempt {total_reconnects}/{MAX_WORKER_RECONNECTS}, backoff {backoff_ms}ms)"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    let min_part = window
-                        .iter()
-                        .map(|(p, _, _)| *p)
-                        .min()
-                        .unwrap_or(part_num)
-                        .min(part_num);
-                    window.clear();
                     let mut g = next_part.lock().await;
-                    *g = (*g).min(min_part);
+                    g.retry(part_num, window.drain(..).map(|(part, _, _)| part));
                     drop(g);
                     sender = match client.open_worker_sender(worker_dc).await {
                         Ok(s) => s,
@@ -2971,16 +2856,8 @@ impl Client {
             });
         }
 
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) =
-                res.map_err(|e| InvocationError::Io(std::io::Error::other(e.to_string())))?
-            {
-                tasks.abort_all();
-                return Err(e);
-            }
-        }
+        finish_upload_workers(tasks).await?;
 
-        let file_id = file_id_atomic.load(std::sync::atomic::Ordering::Relaxed);
         let inner = if big {
             tl::enums::InputFile::Big(tl::types::InputFileBig {
                 id: file_id,
@@ -4860,4 +4737,119 @@ pub fn size_from_media(media: &tl::enums::MessageMedia) -> Option<usize> {
 /// Generate a random upload session file_id. Used by experimental resumable upload.
 pub fn random_file_id_pub() -> i64 {
     crate::random_i64_pub()
+}
+
+#[cfg(test)]
+mod upload_recovery_tests {
+    use super::*;
+
+    fn redirect(dc: u32) -> InvocationError {
+        InvocationError::Rpc(crate::RpcError {
+            code: 303,
+            name: "FILE_MIGRATE".into(),
+            value: Some(dc),
+        })
+    }
+
+    struct WorkerDrop(std::sync::Arc<AtomicBool>);
+
+    impl Drop for WorkerDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_stops_old_workers_before_resetting_progress() {
+        let handle = crate::transfer::TransferHandle::new();
+        handle.set_total(100);
+        let old_stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = retry_migrated_upload(Some(&handle), |dc| {
+            let handle = handle.clone();
+            let old_stopped = std::sync::Arc::clone(&old_stopped);
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    assert_eq!(dc, 0);
+                    let mut workers = tokio::task::JoinSet::new();
+                    let guard = WorkerDrop(std::sync::Arc::clone(&old_stopped));
+                    workers.spawn(async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<(), InvocationError>>().await
+                    });
+                    handle.add_bytes(90);
+                    workers.spawn(async { Err(redirect(5)) });
+                    finish_upload_workers(workers).await
+                } else {
+                    assert_eq!(dc, 5);
+                    assert!(old_stopped.load(Ordering::SeqCst));
+                    assert_eq!(handle.progress().done, 0);
+                    handle.add_bytes(100);
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.progress().done, 100);
+    }
+
+    #[tokio::test]
+    async fn upload_redirects_have_a_finite_retry_budget() {
+        let mut attempts = 0;
+        let result: Result<(), _> = retry_migrated_upload(None, |_| {
+            attempts += 1;
+            std::future::ready(Err(redirect(5)))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_does_not_start_a_new_session() {
+        let handle = crate::transfer::TransferHandle::new();
+        handle.cancel();
+        let mut called = false;
+        let result = retry_migrated_upload(Some(&handle), |_| {
+            called = true;
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!called);
+    }
+
+    #[test]
+    fn reconnect_does_not_reclaim_another_workers_acknowledged_parts() {
+        let mut parts = UploadPartQueue::new(6);
+        let failed = parts.claim().unwrap(); // worker A's part 0
+        let completed_by_b = parts.claim().unwrap(); // worker B's part 1
+        let pending = parts.claim().unwrap(); // worker A's part 2
+        let mut acknowledged = vec![completed_by_b];
+        for _ in 0..3 {
+            acknowledged.push(parts.claim().unwrap());
+        }
+        parts.retry(failed, [pending].into_iter());
+        let mut retried = Vec::new();
+        while let Some(part) = parts.claim() {
+            retried.push(part);
+        }
+        assert_eq!(retried, vec![failed, pending]);
+        assert!(retried.iter().all(|part| !acknowledged.contains(part)));
+    }
+
+    #[test]
+    fn reconnect_retries_the_final_chunk_without_claiming_completed_chunks() {
+        let mut parts = UploadPartQueue::new(4);
+        for _ in 0..3 {
+            parts.claim().unwrap();
+        }
+        let last = parts.claim().unwrap();
+        parts.retry(last, std::iter::empty());
+        assert_eq!(parts.claim(), Some(last));
+        assert_eq!(parts.claim(), None);
+    }
 }
